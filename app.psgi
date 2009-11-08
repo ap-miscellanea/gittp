@@ -8,6 +8,9 @@ use Plack::Request;
 use Try::Tiny;
 use XML::Builder;
 use File::MimeInfo::Magic qw( mimetype globs );
+use constant DIR_STYLE => "\n".<<'';
+ul, li { margin: 0; padding: 0 }
+li { list-style-type: none }
 
 sub git { open my $rh, '-|', git => @_ or die $!; local $/; binmode $rh; <$rh> }
 
@@ -42,21 +45,18 @@ sub get_dir {
 	my $x = XML::Builder->new;
 	my $h = $x->register_ns( 'http://www.w3.org/1999/xhtml', '' );
 
-	return $x->root(
-		$h->html(
-			$h->head(
-				$h->title( $path ),
-				$h->style( { type => 'text/css' },
-					"\nul, li { margin: 0; padding: 0 }",
-					"\nli { list-style-type: none }",
-					"\n",
-				)
-			),
-			$h->body( $h->ul( $h->li->foreach(
-				map { $h->a( { href => $_, class => ( m!(\A\.\.|/)\z! ? 'd' : 'f' ) }, $_ ) } @entry
-			) ) ),
+	return $x->root( $h->html(
+		$h->head(
+			$h->title( $path ),
+			$h->style( { type => 'text/css' }, DIR_STYLE )
 		),
-	);
+		$h->body( $h->ul( "\n", map {; $_, "\n" } $h->li->foreach(
+			map {
+				my $class = m!(\A\.\.|/)\z! ? 'd' : 'f';
+				$h->a( { href => $_, class => $class }, $_ );
+			} @entry
+		) ) ),
+	) );
 }
 
 sub get_mimetype {
