@@ -85,6 +85,12 @@ sub {
 				$res->body( $fh );
 			}
 			when ( 'tree' ) {
+				if ( $path !~ m!/\z! ) {
+					my $uri = $req->uri->clone;
+					$uri->path( $uri->path . '/' );
+					$res->redirect( $uri, 301 );
+					return; # from `try` block
+				}
 				$res->body( get_dir $path );
 				$res->content_type( 'application/xhtml+xml' );
 			}
