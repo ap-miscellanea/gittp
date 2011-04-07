@@ -7,16 +7,17 @@ no warnings qw( once qw );
 use Plack::Request;
 use Try::Tiny;
 use XML::Builder;
+use Git::Repository;
 use File::MimeInfo::Magic qw( mimetype globs );
 use constant DIR_STYLE => "\n".<<'';
 ul, li { margin: 0; padding: 0 }
 li { list-style-type: none }
 
-sub git { open my $rh, '-|', git => @_ or die $!; local $/; binmode $rh; $rh }
+my $git = Git::Repository->new( $ENV{'GIT_DIR'} ? ( git_dir => $ENV{'GIT_DIR'} ) : ( work_tree => '.' ) );
 
-sub type_of { open my $fh, '>&STDERR'; close STDERR; my $_ = readline git 'cat-file' => -t => "HEAD:$_[0]"; open STDERR, '>&='.fileno($fh); s!\s+\z!! if defined; $_ }
+sub type_of { my $_ = eval { $git->run( 'cat-file' => -t => "HEAD:$_[0]" ) }; s!\s+\z!! if defined; $_ }
 
-sub cat_file { git 'cat-file' => blob => "HEAD:$_[0]" }
+sub cat_file { $git->command( 'cat-file' => blob => "HEAD:$_[0]" )->stdout }
 
 sub render_dir {
 	my ( $path ) = @_;
@@ -38,7 +39,7 @@ sub render_dir {
 			$name;
 		}
 		split /\0/,
-		readline git 'ls-tree' => -z => HEAD => ( $prefix ? $path : () );
+		$git->run( 'ls-tree' => -z => HEAD => ( $prefix ? $path : () ) );
 
 	unshift @entry, '..' if $prefix;
 
