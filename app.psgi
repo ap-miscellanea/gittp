@@ -111,7 +111,9 @@ sub {
 		my $obj = $git->load_object( $path );
 		given ( $obj->type ) {
 			when ( 'blob' ) {
-				$res->content_type( $obj->mimetype );
+				my $mime = $obj->mimetype;
+				$mime .= ';charset=utf-8' if 'text/plain' eq $mime;
+				$res->content_type( $mime );
 				$res->body( $obj->content_fh ); # looks like only works w/ streaming servers?
 			}
 			when ( 'tree' ) {
