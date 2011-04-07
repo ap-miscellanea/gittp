@@ -75,6 +75,7 @@ sub {
 
 	my $path = $req->path // '';
 	$path =~ s!\A/!!;
+	$path =~ s!/\z!!;
 
 	try {
 		given ( get_type $path ) {
