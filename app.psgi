@@ -4,28 +4,68 @@ use strict;
 use warnings;
 no warnings qw( once qw );
 
+BEGIN {
+	package Git::Repository::Plugin::LoadObject;
+	use parent 'Git::Repository::Plugin';
+	sub _keywords { 'load_object' }
+	sub load_object { GitObject->new( @_ ) }
+	$INC{'Git/Repository/Plugin/LoadObject.pm'} = 1;
+
+	package GitObject;
+	use Plack::Util::Accessor qw( git type path );
+	use File::MimeInfo::Magic ();
+
+	sub new {
+		my $class = shift;
+		my ( $git, $path ) = @_;
+		my $type = eval { scalar $git->run( 'cat-file' => -t => "HEAD:$path" ) } // '';
+		bless { git => $git, path => $path, type => $type }, $class;
+	}
+
+	sub entries {
+		my $self = shift;
+		die if 'tree' ne $self->type;
+		local $/ = "\0";
+		(
+			#          mode      type      sha1     name
+			map [ m!\A (\S+) [ ] (\S+) [ ] (\S+) \t (.*) \0 \z!x ],
+			readline $self->git->command( 'ls-tree' => -z => HEAD => $self->path )->stdout
+		);
+	}
+
+	sub content_fh {
+		my $self = shift;
+		die if 'blob' ne $self->type;
+		$self->git->command( 'cat-file' => blob => 'HEAD:' . $self->path )->stdout;
+	}
+
+	sub mimetype {
+		my $self = shift;
+		my $type = File::MimeInfo::Magic::mimetype( $self->content_fh );
+		$type = File::MimeInfo::Magic::globs( $self->path ) // $type
+			if $type eq 'application/octet-stream'
+			or $type eq 'text/plain';
+		$type;
+	}
+}
+
+use Git::Repository qw( LoadObject );
 use Plack::Request;
 use Try::Tiny;
 use XML::Builder;
-use Git::Repository;
-use File::MimeInfo::Magic qw( mimetype globs );
 use constant DIR_STYLE => "\n".<<'';
 ul, li { margin: 0; padding: 0 }
 li { list-style-type: none }
 
 my $git = Git::Repository->new( $ENV{'GIT_DIR'} ? ( git_dir => $ENV{'GIT_DIR'} ) : ( work_tree => '.' ) );
 
-sub type_of { my $_ = eval { $git->run( 'cat-file' => -t => "HEAD:$_[0]" ) }; s!\s+\z!! if defined; $_ }
-
-sub cat_file { $git->command( 'cat-file' => blob => "HEAD:$_[0]" )->stdout }
-
 sub render_dir {
-	my ( $path ) = @_;
+	my ( $obj ) = @_;
 
-	$path =~ s!/*\z!/!;
+	my $path = $obj->path;
 
 	my $prefix;
-	$prefix = qr(\A\Q$path) if $path ne '/';
+	$prefix = qr(\A\Q$path) if length $path;
 
 	my @entry
 		= sort {
@@ -33,13 +73,12 @@ sub render_dir {
 			|| ( lc $a cmp lc $b )
 		}
 		map {
-			my ( $mode, $type, $sha1, $name ) = /\A (\S+) [ ] (\S+) [ ] (\S+) \t (.*) \z/sx;
+			my ( $mode, $type, $sha1, $name ) = @$_;
 			$name =~ s!$prefix!! if $prefix;
 			$name .= '/' if $type eq 'tree';
 			$name;
 		}
-		split /\0/,
-		$git->run( 'ls-tree' => -z => HEAD => ( $prefix ? $path : () ) );
+		$obj->entries;
 
 	unshift @entry, '..' if $prefix;
 
@@ -48,7 +87,7 @@ sub render_dir {
 
 	return $x->root( $h->html(
 		$h->head(
-			$h->title( $path ),
+			$h->title( 'gittp: ', $obj->path ? $obj->path : '[root]' ),
 			$h->style( { type => 'text/css' }, DIR_STYLE )
 		),
 		$h->body( $h->ul( "\n", map {; $_, "\n" } $h->li->foreach(
@@ -60,15 +99,6 @@ sub render_dir {
 	) );
 }
 
-sub get_mimetype {
-	my ( $filename, $fh ) = @_;
-	my $type = mimetype $fh;
-	$type = ( globs $filename ) // $type
-		if $type eq 'application/octet-stream'
-		or $type eq 'text/plain';
-	$type;
-}
-
 sub {
 	my $req = Plack::Request->new( shift );
 
@@ -76,23 +106,26 @@ sub {
 
 	my $path = $req->path // '';
 	$path =~ s!\A/!!;
-	$path =~ s!/\z!!;
 
 	try {
-		given ( type_of $path ) {
+		my $obj = $git->load_object( $path );
+		given ( $obj->type ) {
 			when ( 'blob' ) {
-				$res->content_type( get_mimetype $path, cat_file $path );
-				$res->body( cat_file $path ); # will only work in streaming servers...
+				$res->content_type( $obj->mimetype );
+				$res->body( $obj->content_fh ); # looks like only works w/ streaming servers?
 			}
 			when ( 'tree' ) {
-				if ( $req->path !~ m!/\z! ) {
+				if ( $req->path !~ m{ (?<!/) / \z }x ) { # ends in exactly one slash?
 					my $uri = $req->uri->clone;
-					$uri->path( $uri->path . '/' );
+					my $path = $uri->path;
+					$path =~ s!/*\z!/!; # ensure there is exactly one slash
+					$uri->path( $path );
 					$res->redirect( $uri, 301 );
-					return; # from `try` block
 				}
-				$res->body( render_dir $path );
-				$res->content_type( 'application/xhtml+xml' );
+				else {
+					$res->body( render_dir $obj );
+					$res->content_type( 'application/xhtml+xml' );
+				}
 			}
 			default {
 				my $x = XML::Builder->new;
