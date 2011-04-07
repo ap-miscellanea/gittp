@@ -12,13 +12,13 @@ use constant DIR_STYLE => "\n".<<'';
 ul, li { margin: 0; padding: 0 }
 li { list-style-type: none }
 
-sub git { open my $rh, '-|', git => @_ or die $!; local $/; binmode $rh; <$rh> }
+sub git { open my $rh, '-|', git => @_ or die $!; local $/; binmode $rh; $rh }
 
-sub get_type { my $_ = git 'cat-file' => -t => "HEAD:$_[0]"; s!\s+\z!!; $_ }
+sub type_of { open my $fh, '>&STDERR'; close STDERR; my $_ = readline git 'cat-file' => -t => "HEAD:$_[0]"; open STDERR, '>&='.fileno($fh); s!\s+\z!! if defined; $_ }
 
-sub get_file { git 'cat-file' => blob => "HEAD:$_[0]" }
+sub cat_file { git 'cat-file' => blob => "HEAD:$_[0]" }
 
-sub get_dir {
+sub render_dir {
 	my ( $path ) = @_;
 
 	$path =~ s!/*\z!/!;
@@ -38,7 +38,7 @@ sub get_dir {
 			$name;
 		}
 		split /\0/,
-		git 'ls-tree' => -z => HEAD => ( $prefix ? $path : () );
+		readline git 'ls-tree' => -z => HEAD => ( $prefix ? $path : () );
 
 	unshift @entry, '..' if $prefix;
 
@@ -78,21 +78,19 @@ sub {
 	$path =~ s!/\z!!;
 
 	try {
-		given ( get_type $path ) {
+		given ( type_of $path ) {
 			when ( 'blob' ) {
-				open my $fh, '<', \get_file $path;
-				$res->content_type( get_mimetype $path, $fh );
-				seek $fh, 0, 0;
-				$res->body( $fh );
+				$res->content_type( get_mimetype $path, cat_file $path );
+				$res->body( cat_file $path ); # will only work in streaming servers...
 			}
 			when ( 'tree' ) {
-				if ( $path !~ m!/\z! ) {
+				if ( $req->path !~ m!/\z! ) {
 					my $uri = $req->uri->clone;
 					$uri->path( $uri->path . '/' );
 					$res->redirect( $uri, 301 );
 					return; # from `try` block
 				}
-				$res->body( get_dir $path );
+				$res->body( render_dir $path );
 				$res->content_type( 'application/xhtml+xml' );
 			}
 			default {
