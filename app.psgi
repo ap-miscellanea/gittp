@@ -1,5 +1,5 @@
 #!/usr/bin/perl
-use 5.010;
+use 5.014;
 use strict;
 use warnings;
 no warnings qw( once qw );
@@ -52,12 +52,14 @@ BEGIN {
 use Git::Repository qw( LoadObject );
 use Plack::Request;
 use Try::Tiny;
-use XML::Builder;
+use HTML::Escape 'escape_html';
 use constant DIR_STYLE => "\n".<<'';
 ul, li { margin: 0; padding: 0 }
 li { list-style-type: none }
 
 my $git = Git::Repository->new( $ENV{'GIT_DIR'} ? ( git_dir => $ENV{'GIT_DIR'} ) : ( work_tree => '.' ) );
+
+sub unindent { map s!\A\n*(\h*)!!r =~ s!^\Q$1!!mgr =~ s!\s+\z!\n!r, @_ }
 
 sub render_dir {
 	my ( $obj ) = @_;
@@ -82,21 +84,27 @@ sub render_dir {
 
 	unshift @entry, '..' if $prefix;
 
-	my $x = XML::Builder->new;
-	my $h = $x->register_ns( 'http://www.w3.org/1999/xhtml', '' );
+	my $title = $obj->path ? $obj->path : '[root]';
 
-	return $x->root( $h->html(
-		$h->head(
-			$h->title( 'gittp: ', $obj->path ? $obj->path : '[root]' ),
-			$h->style( { type => 'text/css' }, DIR_STYLE )
-		),
-		$h->body( $h->ul( "\n", map {; $_, "\n" } $h->li->foreach(
-			map {
-				my $class = m!(\A\.\.|/)\z! ? 'd' : 'f';
-				$h->a( { href => $_, class => $class }, $_ );
-			} @entry
-		) ) ),
-	) );
+	my $list = join '', map {
+		my $class = m!(\A\.\.|/)\z! ? 'd' : 'f';
+		my $href = escape_html $_;
+		qq(\n<li><a href="$_" class="$class">$_</a><li>);
+	} @entry;
+
+	return unindent qq(
+		<!DOCTYPE html>
+		<html>
+		<head>
+		<title>gittp: ${\escape_html $title}</title>
+		<style>${\DIR_STYLE}</style>
+		</head>
+		<body>
+		<ul>$list
+		</ul>
+		</body>
+		</html>
+	);
 }
 
 sub {
@@ -126,32 +134,32 @@ sub {
 				}
 				else {
 					$res->body( render_dir $obj );
-					$res->content_type( 'application/xhtml+xml' );
+					$res->content_type( 'text/html' );
 				}
 			}
 			default {
-				my $x = XML::Builder->new;
-				my $h = $x->register_ns( 'http://www.w3.org/1999/xhtml', '' );
-
 				$res->status( 404 );
-				$res->content_type( 'application/xhtml+xml' );
-				$res->body( $x->root( $h->html(
-					$h->head( $h->title( $path ) ),
-					$h->body( $h->h1( '404 Not Found' ) ),
-				) ) );
+				$res->content_type( 'text/html' );
+				$res->body( unindent qq(
+					<!DOCTYPE html>
+					<html>
+					<head><title>${\escape_html $path}</title></head>
+					<body><h1>404 Not Found</h1></body>
+					</html>
+				) );
 			}
 		}
 	}
 	catch {
-		my $x = XML::Builder->new;
-		my $h = $x->register_ns( 'http://www.w3.org/1999/xhtml', '' );
-
 		$res->status( 500 );
-		$res->content_type( 'application/xhtml+xml' );
-		$res->body( $x->root( $h->html(
-			$h->head( $h->title( 'Internal Server Error' ) ),
-			$h->body( $h->pre( $_ ) ),
-		) ) );
+		$res->content_type( 'text/html' );
+		$res->body( unindent qq(
+			<!DOCTYPE html>
+			<html>
+			<head><title>Internal Server Error</title></head>
+			<body><pre>${\escape_html $_}</pre></body>
+			</html>
+		) );
 	};
 
 	$res->finalize;
