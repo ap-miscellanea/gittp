@@ -69,6 +69,8 @@ sub render_dir {
 	my $prefix;
 	$prefix = qr(\A\Q$path) if length $path;
 
+	my $index_sha1;
+
 	my @entry
 		= sort {
 			( ( $b =~ m!/\z! ) <=> ( $a =~ m!/\z! ) )  # dirs first
@@ -77,10 +79,14 @@ sub render_dir {
 		map {
 			my ( $mode, $type, $sha1, $name ) = @$_;
 			$name =~ s!$prefix!! if $prefix;
+			$index_sha1 = $sha1 if 'index.html' eq $name;
 			$name .= '/' if $type eq 'tree';
 			$name;
 		}
 		$obj->entries;
+
+	return $git->command( 'cat-file' => blob => $index_sha1 )->stdout
+		if $index_sha1;
 
 	unshift @entry, '..' if $prefix;
 
