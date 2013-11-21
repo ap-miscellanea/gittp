@@ -2,111 +2,62 @@
 use 5.014;
 use strict;
 use warnings;
-no warnings qw( once qw );
 
-BEGIN {
-	package Git::Repository::Plugin::LoadObject;
-	use parent 'Git::Repository::Plugin';
-	sub _keywords { 'load_object' }
-	sub load_object { GitObject->new( @_ ) }
-	$INC{'Git/Repository/Plugin/LoadObject.pm'} = 1;
-
-	package GitObject;
-	use Plack::Util::Accessor qw( git type path );
-	use File::MimeInfo::Magic ();
-
-	sub new {
-		my $class = shift;
-		my ( $git, $path ) = @_;
-		my $type = eval { scalar $git->run( 'cat-file' => -t => "HEAD:$path" ) } // '';
-		bless { git => $git, path => $path, type => $type }, $class;
-	}
-
-	sub entries {
-		my $self = shift;
-		die if 'tree' ne $self->type;
-		local $/ = "\0";
-		(
-			#          mode      type      sha1     name
-			map [ m!\A (\S+) [ ] (\S+) [ ] (\S+) \t (.*) \0 \z!x ],
-			readline $self->git->command( 'ls-tree' => -z => HEAD => $self->path )->stdout
-		);
-	}
-
-	sub content_fh {
-		my $self = shift;
-		die if 'blob' ne $self->type;
-		$self->git->command( 'cat-file' => blob => 'HEAD:' . $self->path )->stdout;
-	}
-
-	sub mimetype {
-		my $self = shift;
-		my $type = File::MimeInfo::Magic::mimetype( $self->content_fh );
-		$type = File::MimeInfo::Magic::globs( $self->path ) // $type
-			if $type eq 'application/octet-stream'
-			or $type eq 'text/plain';
-		$type;
-	}
-}
-
-use Git::Repository qw( LoadObject );
-use Plack::Request;
-use Try::Tiny;
+use Git::Raw ();
+use File::MimeInfo::Magic ();
+use Plack::Request ();
 use HTML::Escape 'escape_html';
+use Scalar::Util 'blessed';
+use List::Util 'reduce';
 use constant DIR_STYLE => "\n".<<'';
 ul, li { margin: 0; padding: 0 }
 li { list-style-type: none }
 
-my $git = Git::Repository->new( $ENV{'GIT_DIR'} ? ( git_dir => $ENV{'GIT_DIR'} ) : ( work_tree => '.' ) );
+my $git = Git::Raw::Repository->open( $ENV{'GIT_DIR'} // '.' );
 
 sub unindent { map s!\A\n*(\h*)!!r =~ s!^\Q$1!!mgr =~ s!\s+\z!\n!r, @_ }
 
+sub mimetype {
+	my ( $name, $content_r ) = @_;
+	open my $fh, '<', $content_r or die '!?';
+	my $type = File::MimeInfo::Magic::mimetype( $fh );
+	$type = File::MimeInfo::Magic::globs( $name ) // $type
+		if $type eq 'application/octet-stream'
+		or $type eq 'text/plain';
+	$type;
+}
+
 sub render_dir {
-	my ( $obj ) = @_;
-
-	my $path = $obj->path;
-
-	my $prefix;
-	$prefix = qr(\A\Q$path) if length $path;
+	my ( $path, $tree ) = @_;
 
 	my $index_sha1;
 
-	my @entry
-		= sort {
-			( ( $b =~ m!/\z! ) <=> ( $a =~ m!/\z! ) )  # dirs first
-			|| ( lc $a cmp lc $b )
-		}
+	my @entry =
+		map { $_->[0] }
+		sort { ( $a->[1] cmp $b->[1] ) || ( $a->[2] cmp $b->[2] ) }
 		map {
-			my ( $mode, $type, $sha1, $name ) = @$_;
-			$name =~ s!$prefix!! if $prefix;
-			$index_sha1 = $sha1 if 'index.html' eq $name;
-			$name .= '/' if $type eq 'tree';
-			$name;
+			my $object = $_->object;
+			my $name   = $_->name;
+			return $object->content if 'index.html' eq $name;
+			my $class = $object->isa( 'Git::Raw::Tree' ) ? 'd' : 'f';
+			$name .= '/' if 'd' eq $class;
+			my $href = escape_html $name;
+			my $link = qq(\n<li><a href="$href" class="$class">$href</a><li>);
+			[ $link, $class eq 'f', lc $name ];
 		}
-		$obj->entries;
+		@{ $tree->entries };
 
-	return $git->command( 'cat-file' => blob => $index_sha1 )->stdout
-		if $index_sha1;
-
-	unshift @entry, '..' if $prefix;
-
-	my $title = $obj->path ? $obj->path : '[root]';
-
-	my $list = join '', map {
-		my $class = m!(\A\.\.|/)\z! ? 'd' : 'f';
-		my $href = escape_html $_;
-		qq(\n<li><a href="$_" class="$class">$_</a><li>);
-	} @entry;
+	unshift @entry, '<li><a href=".." class="d">..</a></li>' if $path;
 
 	return unindent qq(
 		<!DOCTYPE html>
 		<html>
 		<head>
-		<title>gittp: ${\escape_html $title}</title>
+		<title>gittp: ${\escape_html $path || '[root]'}</title>
 		<style>${\DIR_STYLE}</style>
 		</head>
 		<body>
-		<ul>$list
+		<ul>${\join "\n", @entry}
 		</ul>
 		</body>
 		</html>
@@ -116,57 +67,53 @@ sub render_dir {
 sub {
 	my $req = Plack::Request->new( shift );
 
-	my $res = $req->new_response( 200 );
+	my $res = $req->new_response( 404 );
 
 	my $path = $req->path // '';
 	$path =~ s!\A/!!;
 
-	try {
-		my $obj = $git->load_object( $path );
-		given ( $obj->type ) {
-			when ( 'blob' ) {
-				my $mime = $obj->mimetype;
-				$mime .= ';charset=utf-8' if 'text/plain' eq $mime;
-				$res->content_type( $mime );
-				$res->body( $obj->content_fh ); # looks like only works w/ streaming servers?
+	my $object = eval {
+		reduce { $a->entry_byname( $b )->object }
+		$git->head->target->tree,
+		split '/', $path
+	};
+
+	if ( blessed $object ) {
+		if ( $object->isa( 'Git::Raw::Blob' ) ) {
+			my $content = $object->content;
+			my $mime = mimetype $path, \$content;
+			$mime .= ';charset=utf-8' if 'text/plain' eq $mime;
+			$res->status( 200 );
+			$res->content_type( $mime );
+			$res->content_length( $object->size );
+			$res->body( $content );
+		}
+		elsif ( $object->isa( 'Git::Raw::Tree' ) ) {
+			if ( $req->path !~ m{ (?<!/) / \z }x ) { # ends in exactly one slash?
+				my $uri = $req->uri->clone;
+				my $path = $uri->path;
+				$path =~ s!/*\z!/!; # ensure there is exactly one slash
+				$uri->path( $path );
+				$res->redirect( $uri, 301 );
 			}
-			when ( 'tree' ) {
-				if ( $req->path !~ m{ (?<!/) / \z }x ) { # ends in exactly one slash?
-					my $uri = $req->uri->clone;
-					my $path = $uri->path;
-					$path =~ s!/*\z!/!; # ensure there is exactly one slash
-					$uri->path( $path );
-					$res->redirect( $uri, 301 );
-				}
-				else {
-					$res->body( render_dir $obj );
-					$res->content_type( 'text/html' );
-				}
-			}
-			default {
-				$res->status( 404 );
+			else {
+				$res->status( 200 );
+				$res->body( render_dir $path, $object );
 				$res->content_type( 'text/html' );
-				$res->body( unindent qq(
-					<!DOCTYPE html>
-					<html>
-					<head><title>${\escape_html $path}</title></head>
-					<body><h1>404 Not Found</h1></body>
-					</html>
-				) );
 			}
 		}
 	}
-	catch {
-		$res->status( 500 );
+
+	if ( 404 eq $res->status ) {
 		$res->content_type( 'text/html' );
 		$res->body( unindent qq(
 			<!DOCTYPE html>
 			<html>
-			<head><title>Internal Server Error</title></head>
-			<body><pre>${\escape_html $_}</pre></body>
+			<head><title>${\escape_html $path}</title></head>
+			<body><h1>404 Not Found</h1></body>
 			</html>
 		) );
-	};
+	}
 
 	$res->finalize;
 }
