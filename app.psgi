@@ -15,7 +15,7 @@ li { list-style-type: none }
 
 my $git = Git::Raw::Repository->open( $ENV{'GIT_DIR'} // '.' );
 
-sub unindent { map s!\A\n*(\h*)!!r =~ s!^\Q$1!!mgr =~ s!\s+\z!\n!r, @_ }
+sub unindent { ( map s!\A\n*(\h*)!!r =~ s!^\Q$1!!mgr =~ s!\s+\z!\n!r, @_ )[ 0 .. $#_ ] }
 
 sub mimetype {
 	my ( $name, $content_r ) = @_;
@@ -38,7 +38,7 @@ sub render_dir {
 		map {
 			my $object = $_->object;
 			my $name   = $_->name;
-			return $object->content if 'index.html' eq $name;
+			return $object if 'index.html' eq $name;
 			my $class = $object->isa( 'Git::Raw::Tree' ) ? 'd' : 'f';
 			$name .= '/' if 'd' eq $class;
 			my $href = escape_html $name;
@@ -67,7 +67,7 @@ sub render_dir {
 sub {
 	my $req = Plack::Request->new( shift );
 
-	my $res = $req->new_response( 404 );
+	my $res = $req->new_response( 200 );
 
 	my $path = $req->path // '';
 	$path =~ s!\A/!!;
@@ -78,42 +78,46 @@ sub {
 		split '/', $path
 	};
 
-	if ( blessed $object ) {
-		if ( $object->isa( 'Git::Raw::Blob' ) ) {
-			my $content = $object->content;
-			my $mime = mimetype $path, \$content;
-			$mime .= ';charset=utf-8' if 'text/plain' eq $mime;
-			$res->status( 200 );
-			$res->content_type( $mime );
-			$res->content_length( $object->size );
+	if ( blessed $object and $object->isa( 'Git::Raw::Tree' ) ) {
+		if ( $req->path !~ m{ (?<!/) / \z }x ) { # ends in exactly one slash?
+			my $uri = $req->uri->clone;
+			my $path = $uri->path;
+			$path =~ s!/*\z!/!; # ensure there is exactly one slash
+			$uri->path( $path );
+			$res->redirect( $uri, 301 );
+			return $res->finalize;
+		}
+
+		my $content = render_dir $path, $object;
+
+		if ( not ref $content ) {
+			$res->content_type( 'text/html' );
+			$res->content_length( length $content );
 			$res->body( $content );
+			return $res->finalize;
 		}
-		elsif ( $object->isa( 'Git::Raw::Tree' ) ) {
-			if ( $req->path !~ m{ (?<!/) / \z }x ) { # ends in exactly one slash?
-				my $uri = $req->uri->clone;
-				my $path = $uri->path;
-				$path =~ s!/*\z!/!; # ensure there is exactly one slash
-				$uri->path( $path );
-				$res->redirect( $uri, 301 );
-			}
-			else {
-				$res->status( 200 );
-				$res->body( render_dir $path, $object );
-				$res->content_type( 'text/html' );
-			}
-		}
+
+		$object = $content;
 	}
 
-	if ( 404 eq $res->status ) {
-		$res->content_type( 'text/html' );
-		$res->body( unindent qq(
-			<!DOCTYPE html>
-			<html>
-			<head><title>${\escape_html $path}</title></head>
-			<body><h1>404 Not Found</h1></body>
-			</html>
-		) );
+	if ( blessed $object and $object->isa( 'Git::Raw::Blob' ) ) {
+		my $content = $object->content;
+		my $mime = mimetype $path, \$content;
+		$mime .= ';charset=utf-8' if 'text/plain' eq $mime;
+		$res->content_type( $mime );
+		$res->content_length( $object->size );
+		$res->body( $content );
+		return $res->finalize;
 	}
 
+	$res->status( 404 );
+	$res->content_type( 'text/html' );
+	$res->body( unindent qq(
+		<!DOCTYPE html>
+		<html>
+		<head><title>${\escape_html $path}</title></head>
+		<body><h1>404 Not Found</h1></body>
+		</html>
+	) );
 	$res->finalize;
 }
